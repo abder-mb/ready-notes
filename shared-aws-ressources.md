@@ -2192,37 +2192,120 @@ graph TB
 ```
 
 
+Catalog Architecture layers
+
+```mermaid
+graph TB
+    subgraph L1["LAYER 1: Storage - Where Data Lives"]
+        S3P["S3 Bucket - Producer<br/>s3://producer-data/sales/"]
+        S3P2["S3 Bucket - Producer 2<br/>s3://producer2-data/marketing/"]
+    end
+    
+    subgraph L2["LAYER 2: Technical Metadata - AWS Glue Catalogs"]
+        direction TB
+        
+        subgraph AP["Account P - Producer 1"]
+            GCP["Glue Data Catalog<br/>Database: sales_db<br/>Table: orders<br/>Columns: order_id, amount, date<br/>Location: s3://producer-data/sales/"]
+        end
+        
+        subgraph AP2["Account P2 - Producer 2"]
+            GCP2["Glue Data Catalog<br/>Database: marketing_db<br/>Table: campaigns<br/>Columns: campaign_id, budget<br/>Location: s3://producer2-data/"]
+        end
+        
+        subgraph AC["Account C - Consumer"]
+            GCC["Glue Data Catalog<br/>Local: my_local_db<br/>Shared: sales_db from P<br/>Shared: marketing_db from P2"]
+        end
+    end
+    
+    subgraph L3["LAYER 3: Governance & Sharing - Lake Formation"]
+        direction TB
+        
+        subgraph PRA["Producer Accounts"]
+            LFP["Lake Formation P<br/>Share sales_db to M"]
+            LFP2["Lake Formation P2<br/>Share marketing_db to M"]
+        end
+        
+        subgraph MAIN["Main SMUS Domain"]
+            LFM["Lake Formation M<br/>Received: sales_db, marketing_db<br/>Grant to: Account C"]
+        end
+        
+        subgraph CONS["Consumer Account"]
+            LFC["Lake Formation C<br/>Permissions: SELECT on shared DBs"]
+        end
+    end
+    
+    subgraph L4["LAYER 4: Business Layer - SMUS Catalog"]
+        SMUS["SMUS Data Catalog<br/>Dataset: Sales Orders<br/>Owner: Sales Team<br/>Quality: 95%<br/>Tags: PII, Finance<br/>Dataset: Marketing Campaigns<br/>Owner: Marketing Team"]
+    end
+    
+    subgraph L5["LAYER 5: Consumer Tools"]
+        TOOLS["SageMaker Unified Studio<br/>Amazon Athena<br/>Data Wrangler<br/>SageMaker Notebooks"]
+    end
+    
+    S3P -->|metadata| GCP
+    S3P2 -->|metadata| GCP2
+    
+    GCP -->|share| LFP
+    GCP2 -->|share| LFP2
+    
+    LFP -->|send to| LFM
+    LFP2 -->|send to| LFM
+    
+    LFM -->|import| SMUS
+    LFM -->|grant| LFC
+    
+    LFC -->|visible in| GCC
+    
+    GCC -->|query| TOOLS
+    SMUS -->|discover| TOOLS
+    
+    TOOLS -->|read data| S3P
+    TOOLS -->|read data| S3P2
+    
+    style S3P fill:#FF9800,color:#000
+    style S3P2 fill:#FF9800,color:#000
+    style GCP fill:#FFC107,color:#000
+    style GCP2 fill:#FFC107,color:#000
+    style GCC fill:#FFC107,color:#000
+    style LFP fill:#4ECDC4,color:#000
+    style LFP2 fill:#4ECDC4,color:#000
+    style LFM fill:#4ECDC4,color:#000
+    style LFC fill:#4ECDC4,color:#000
+    style SMUS fill:#FF6B6B,color:#000
+    style TOOLS fill:#95E1D3,color:#000
+```
 
 
-----------------------------------------------------------------------------------------------------
 
-## Managmement APP
+**5 Clear Layers:**
+1. **Storage Layer** - S3 buckets with actual data
+2. **Technical Metadata** - Glue Catalogs in each account
+3. **Governance** - Lake Formation managing permissions and sharing
+4. **Business Layer** - SMUS Catalog with enriched metadata
+5. **Consumer Tools** - Applications that use the catalogs
 
-The creation of a management application for Amazon SageMaker Unified Studio (SMUS) using AWS Python SDKs (like Boto3) would primarily involve interfacing with the specialized Amazon SageMaker Unified Studio Library for Python for foundational project interactions, and the underlying AWS DataZone and other AWS service SDKs for catalog, asset, and security management.
-The sources explicitly mention the existence and capabilities of the sagemaker_studio Python library and provide many API and CLI references that map to AWS DataZone service actions.
-Here is a table detailing the relevant management features, the appropriate SDKs, and corresponding functions as described in the provided sources:
-
-
-
-The creation of a management application for Amazon SageMaker Unified Studio (SMUS) using AWS Python SDKs (like Boto3) would primarily involve interfacing with the specialized **Amazon SageMaker Unified Studio Library for Python** for foundational project interactions, and the underlying **AWS DataZone** and other AWS service SDKs for catalog, asset, and security management.
-
-The sources explicitly mention the existence and capabilities of the `sagemaker_studio` Python library and provide many API and CLI references that map to AWS DataZone service actions.
-
-Here is a table detailing the relevant management features, the appropriate SDKs, and corresponding functions as described in the provided sources:
-
+The flow is now clearly visible:
+- Data flows from S3 → Glue Catalogs
+- Sharing flows through Lake Formation
+- SMUS aggregates everything
+- Consumers access through their local Glue Catalog
+- Tools read from both catalogs and S3 directly
 
 
-| Feature/Functionality | AWS SDK/Library | Adapted Functions (API/Client Methods) | Link to SDK Documentation | Additional Context |
-| :--- | :--- | :--- | :--- | :--- |
-| **Project & Domain Information (Read)** | **SageMaker Unified Studio Library for Python** (`sagemaker_studio`) | `Domain(id=...)` (for domain details) `Project(name=..., domain_id=...)` (for project details) `proj.iam_role`, `proj.s3.root` (for role ARN and S3 paths) | Not Available (Source is internal guide documentation) | This library provides direct access to project and domain properties like ID, ARN, status, execution role ARN, and various S3 paths. It is supported in JupyterLab/Code Editor. |
-| **Asset Creation (Data Sources)** | **AWS DataZone SDK** (inferred from CLI) | `CreateDataSource` (e.g., for AWS Glue, Amazon Redshift, Amazon SageMaker AI source types) | Not Available | Creating data sources adds metadata about external tables/views to the SMUS project inventory and enables publishing to the centralized Catalog. The command uses `aws datazone create-data-source`. |
-| **Metadata Management (Data Quality)** | **AWS DataZone SDK** (inferred from CLI/API) | `PostTimeSeriesDataPoints` `ListTimeSeriesDataPoints` `DeleteTimeSeriesDataPoints` | Not Available | Used for importing data quality metrics from AWS Glue or third-party solutions for custom asset types. Requires the Domain ID and Entity ID (asset). |
-| **Asset Metadata Export** | **AWS DataZone SDK** (inferred from CLI/API) | `PutDataExportConfiguration` | Not Available | Enables exporting catalog asset metadata into a queryable Apache Iceberg table in Amazon S3 for reporting and auditing purposes. |
-| **Permissions (AWS Glue Access Grants)** | **AWS Lake Formation SDK** (inferred from service actions) | `GrantPermissions` (for managing DESCRIBE, SELECT permissions via Data Cell Filters) | Not Available | For managed AWS Glue tables, SMUS implements access control by creating grants in AWS Lake Formation, typically using Data Cell Filters when row/column filters are applied. |
-| **Permissions (Redshift Access Grants)** | **Amazon Redshift SDK** (inferred from service actions) | Functions related to creating scoped-down late binding views and managing datashares | Not Available | For managed Amazon Redshift assets, access is materialized by creating late binding views and managing datashares between publisher and subscriber projects. |
-| **External Data Query Authentication** | **AWS SSO Oauth** (inferred from API) | `RedeemAccessToken` | Not Available | Used by external analytics applications (via Athena JDBC driver) to exchange an Identity Center access token for `AmazonDataZoneDomainExecutionRole` credentials, enabling query access to governed data. |
-| **Automation Workflow Integration** | **Amazon EventBridge SDK** | Actions related to event consumption, forwarding, and rules configuration | Not Available | Project creation emits a `CreateProject` event captured by AWS CloudTrail and bridged to an EventBridge bus. Subscription approval for unmanaged assets publishes an event to EventBridge, triggering custom fulfillment handlers. |
-| **Notebook Execution (Headless)** | **SageMaker Unified Studio Library for Python** (`sagemaker_studio`) | `execution_client.start_execution` (local or remote) `execution_client.get_execution` `execution_client.list_executions` `execution_client.stop_execution` | Not Available (Source is internal guide documentation) | Allows notebooks to be executed headlessly (without an active UI session) either in the user's space (local) or on remote compute. |
+
+**The diagram now clearly shows:**
+
+- **Layer 1**: Physical storage (S3 buckets)
+- **Layer 2**: Three separate Glue Catalogs (Producer 1, Producer 2, Consumer)
+- **Layer 3**: Lake Formation handling permissions and sharing
+- **Layer 4**: SMUS Catalog as the business/governance layer
+- **Layer 5**: Consumer tools that access everything
+
+**Key flows visible:**
+- Metadata extraction from S3 → Glue
+- Sharing from Producers → Main Domain → Consumer
+- SMUS importing and enriching metadata
+- Tools accessing both catalogs and reading data directly from S3
 
 
 
