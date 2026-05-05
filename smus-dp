@@ -296,4 +296,129 @@ The most scalable model for you is:
 - **Catalog publication** is the final discoverability step for consumers. [docs.aws.amazon](https://docs.aws.amazon.com/lake-formation/latest/dg/cross-account-permissions.html)
 
 That maps cleanly to your requirement: publishers cannot create SMUS assets directly, but they can safely choose which of their Glue tables should become catalog assets, and consumers only discover the assets after backend publication. [docs.aws.amazon](https://docs.aws.amazon.com/fr_fr/sagemaker-unified-studio/latest/userguide/publishing-data-asset.html)
+-----
+Yes — here’s exactly how P1’s Lake Formation share works and how M sees/accesses that table.
+
+We’ll cover the producer steps (P1), the consumer acceptance (M), and what you must set so your management app can list and use the shared table.
+## 1) Producer (P1): give cross-account Lake Formation permissions to account M
+In P1’s account, the table must be Lake Formation governed, and you grant access to the external account M ID. You do this in Lake Formation console or API with a GRANT operation. [docs.aws.amazon](https://docs.aws.amazon.com/lake-formation/latest/dg/cross-account-permissions.html)
+
+Steps in console (P1):
+
+1. Open Lake Formation → “Data lake permissions” → Grant.
+2. For **Principals**, choose **External accounts**, enter account M ID.
+3. For **Database**, select the database containing your table.
+4. For **Tables**, choose the specific table (or a few selected tables, or “All tables”).
+5. Set permissions:
+   - on DB: `DESCRIBE` (+ `GRANT` option if you want the consumer to further grant),
+   - on table: `SELECT`, `DESCRIBE` (+ `GRANT` option if needed).
+6. Confirm and apply the grant. [aws.amazon](https://aws.amazon.com/blogs/big-data/securely-share-your-data-across-aws-accounts-using-aws-lake-formation/)
+
+API sketch:
+
+```python
+import boto3
+lf = boto3.client("lakeformation", region="us-east-1")
+
+lf.grant_permissions(
+    CatalogId="P1_ACCOUNT_ID",
+    Principal={"DataLakePrincipals": [{"ARN": "arn:aws:iam::M_ACCOUNT_ID:root"}]},
+    Resource={"Database": {"Name": "prod_db"}},
+    Permissions=["DESCRIBE"],
+    GrantablePermissions=["DESCRIBE"]
+)
+
+lf.grant_permissions(
+    CatalogId="P1_ACCOUNT_ID",
+    Principal={"DataLakePrincipals": [{"ARN": "arn:aws:iam::M_ACCOUNT_ID:root"}]},
+    Resource={"Table": {"DatabaseName": "prod_db", "Name": "my_table"}},
+    Permissions=["SELECT", "DESCRIBE"],
+    GrantablePermissions=["SELECT", "DESCRIBE"]
+)
+```
+
+AWS RAM is automatically used under the hood to share the catalog resources. As of early 2026, Lake Formation uses a single RAM resource share for unlimited tables, with wildcard patterns rather than individual associations. [aws.amazon](https://aws.amazon.com/about-aws/whats-new/2026/02/aws-lake-formation-cross-account-sharing/)
+
+EDIA: Only LF admins can see the share; end users in the consumer account are later given permissions by the consumer LF admin. [docs.aws.amazon](https://docs.aws.amazon.com/lake-formation/latest/dg/cross-account-permissions.html)
+## 2) Consumer (M): accept the RAM share and see the table
+Access from M depends on whether P1 and M are in the same AWS Organization. [aws.amazon](https://aws.amazon.com/blogs/big-data/securely-share-your-data-across-aws-accounts-using-aws-lake-formation/)
+### If same organization
+- If P1 and M are in the same AWS Organization/OU:
+  - If P1 and M are in the same AWS Organization or organizational unit (OU), the shared resource is immediately available M-side under the shared tab in Lake Formation. [youtube](https://www.youtube.com/watch?v=S-Mdcmq6oPM)
+  - RAM assume-accept flow is typically automatic for orgs; M may not need manual acceptance.
+- M will see the shared database and tables under Lake Formation → “Data permissions” and the “Shared with me” section.
+### If different organizations
+1. In M, go to RAM → **Shared with me** → **Resource shares**.
+2. Accept the incoming Lake Formation resource share from P1. [aws.amazon](https://aws.amazon.com/blogs/big-data/securely-share-your-data-across-aws-accounts-using-aws-lake-formation/)
+3. After acceptance, the shared DB/table appears in M’s Lake Formation console.
+
+At this point, M does not yet automatically get full browsing access for all its users; first, M’s Lake Formation admin must grant local permissions.
+## 3) M: grant permissions to your backend/project roles
+By default, only the Lake Formation admin in M can use the shared resources. To let your backend and SMUS project role access them, you must explicitly grant permissions on the shared DB/table to:
+
+- your **management discovery role** (for listing tables),
+- your **SMUS project IAM role** (for reading and publishing as a managed asset). [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/grant-access-to-glue-asset.html)
+
+In M, as LF admin:
+
+1. Lake Formation → Data lake permissions → Grant.
+2. Principals: IAM role ARN(s), e.g.:
+   - `arn:aws:iam::M_ACCOUNT_ID:role/management-discovery-role`
+   - `arn:aws:iam::M_ACCOUNT_ID:role/smus-project-role`
+3. Resource: the shared database and table.
+4. Permissions (same as above):
+   - DB: `DESCRIBE`
+   - Table: `SELECT`, `DESCRIBE` (and `GRANT` if needed). [docs.aws.amazon](https://docs.aws.amazon.com/lake-formation/latest/dg/cross-account-permissions.html)
+
+For managed Glue assets in SMUS, AWS explicitly states the publishing project role must have `DESCRIBE`, `DESCRIBE GRANTABLE`, `SELECT`, and `SELECT GRANTABLE` on the database/table. [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/grant-access-to-glue-asset.html)
+## 4) How M “sees” the table
+Thanks to Lake Formation’s cross-account feature, the shared metadata appears in M as if it were local:
+
+- In Lake Formation console, under Databases, you’ll see the shared DB and tables. [aws.amazon](https://aws.amazon.com/blogs/big-data/securely-share-your-data-across-aws-accounts-using-aws-lake-formation/)
+- In Athena (in M), you can query `SELECT * FROM prod_db.my_table` as long as the query principal has LF permissions. [blog.pesky](https://blog.pesky.moe/posts/2025-08-12-glue-region/)
+- In your backend, using boto3 with the discovery role, you can list tables using `glue:GetTables` on the shared DB or query roster views via Lake Formation.
+
+From M, the guidance is that “users and Glue jobs can query and join tables across multiple accounts” while benefiting from LF-level/column protections. [docs.aws.amazon](https://docs.aws.amazon.com/lake-formation/latest/dg/cross-account-permissions.html)
+
+Practically, the backend runs something like:
+
+```python
+glue = boto3.client("glue", region="us-east-1")
+
+tables = glue.get_tables(
+    DatabaseName="prod_db",  # the shared DB
+    MaxResults=100
+)
+```
+
+If `get_tables` is called using a role that has LF permissions on that DB/table in M, it returns the shared tables from P1. [docs.aws.amazon](https://docs.aws.amazon.com/lake-formation/latest/dg/cross-account-permissions.html)
+## 5) Optional: create resource links in M
+If you want the shared catalog to appear in other regions, or want a consistent local naming pattern, you can create resource links:
+
+1. In M, open Lake Formation.
+2. Under Databases, create a **resource link** for the shared database/table. [aws.github](https://aws.github.io/aws-lakeformation-best-practices/data-sharing/general-data-sharing/)
+3. Use that link name in downstream access (e.g., Athena, SMUS data sources, your app). [blog.pesky](https://blog.pesky.moe/posts/2025-08-12-glue-region/)
+
+Note: permissions on the resource link and on the underlying target are separate. You must grant permissions both:
+- on the target in P1 to M (cross-account grant),
+- on the resource link in M to local roles. [docs.aws.amazon](https://docs.aws.amazon.com/lake-formation/latest/dg/granting-link-permissions.html)
+## 6) How your app/UI discovers the table
+Your management backend uses the discovery role in M to enumerate shared tables:
+
+- Filter to databases/tables belonging to each publisher (you can tag or encode `publisher_id` in metadata tags/parameters on the DB/table).
+- Store those rows in RDS into `eligible_source_tables`. [docs.aws.amazon](https://docs.aws.amazon.com/lake-formation/latest/dg/cross-account-permissions.html)
+- UI then just reads from RDS and shows only rows for that publisher.
+
+This avoids live cross-account `get_tables` per user session and keeps authorization centralized in your backend. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/userguide/publishing-data.html)
+## 7) Steps summary for P1 → M
+**Producer side (P1):**
+- Ensure table is Lake Formation governed.
+- Grant cross-account permissions to M: `DESCRIBE` on DB, `SELECT` + `DESCRIBE` on table.
+- Optionally grant `GRANT` options if M must redelegate.
+
+**Consumer side (M):**
+1. Accept RAM share (if not same org).
+2. Grant local permissions to discovery role + SMUS project role.
+3. Optionally create resource links.
+4. Backend reads shared metadata via Glue/Lake Formation, populates RDS. [docs.aws.amazon](https://docs.aws.amazon.com/lake-formation/latest/dg/cross-account-permissions.html)
 
