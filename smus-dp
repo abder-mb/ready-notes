@@ -2,3 +2,298 @@
 - https://aws.amazon.com/fr/blogs/big-data/navigating-multi-account-deployments-in-amazon-sagemaker-unified-studio-a-governance-first-approach/
 - https://docs.aws.amazon.com/lake-formation/latest/dg/hybrid-cross-account.html
 - https://docs.aws.amazon.com/lake-formation/latest/dg/cross-account-permissions.html
+
+
+Yes. The right design is to make the management backend own the entire **publish pipeline**, while publishers only interact with an **eligible source tables** picker. In other words: publishers create Glue tables in their own account, your backend builds and maintains a curated inventory of tables they are allowed to publish, and when they select one, the backend runs the SMUS/DataZone automation so the resulting asset becomes discoverable to consumers. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/userguide/create-glue-data-source.html)
+
+## Data model
+
+Use a backend-owned table such as `eligible_source_tables` in RDS as the UI’s source of truth. Each row should represent one producer Glue table that is technically reachable and governance-approved for publication. [docs.aws.amazon](https://docs.aws.amazon.com/lake-formation/latest/dg/cross-account-permissions.html)
+
+Suggested columns:
+- `publisher_account_id`, `publisher_principal_id`, `project_id`, `environment_id`
+- `source_region`, `source_database`, `source_table`
+- `share_status`, `resource_link_status`, `inventory_status`, `publish_status`
+- `glue_table_arn`, `resource_link_name`, `data_source_id`, `inventory_asset_id`
+- `last_sync_at`, `owner_tag`, `eligible_boolean`, `eligibility_reason`  
+This lets the UI filter to “tables visible to this publisher and ready for asset creation,” while keeping enough IDs for your automation steps. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/APIReference/API_CreateDataSource.html)
+
+## Access model
+
+Publishers should authenticate only to your application. They should not call SMUS/DataZone publish APIs themselves, and ideally they should not browse producer Glue catalogs live from the frontend either. [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/data-publishing.html)
+
+Your app backend should enforce authorization like this:
+- map the logged-in publisher to one or more producer accounts/projects,
+- query `eligible_source_tables`,
+- return only rows where `publisher_principal_id` or `publisher_account_id` matches that publisher,
+- allow submit only for rows with `eligible_boolean = true`.  
+This gives you app-level tenant isolation, while AWS remains the control plane for technical discovery and publication. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/userguide/create-glue-data-source.html)
+
+## AWS roles
+
+You need three main service-side roles:
+
+| Role | Purpose | Key capabilities |
+|---|---|---|
+| Producer onboarding/share role | In producer account; prepares tables for discovery in M | Lake Formation cross-account grants on DB/table; optional share automation.  [docs.aws.amazon](https://docs.aws.amazon.com/lake-formation/latest/dg/cross-account-permissions.html) |
+| Management discovery role | In account M; refreshes `eligible_source_tables` | Read shared Glue metadata, list resource links, run DataZone/SMUS data-source discovery.  [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/data-source-glue.html) |
+| Management publish role | In account M / SMUS project context | Create/run data sources, update inventory metadata, publish inventory assets.  [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/APIReference/API_CreateDataSource.html) |
+
+For Lake Formation-managed Glue assets, AWS states the publishing project role must have `DESCRIBE`, `DESCRIBE GRANTABLE`, `SELECT`, and `SELECT GRANTABLE` on the relevant database/table. That permission set belongs to the backend/project role used for publication, not to the end-user publisher in your UI. [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/grant-access-to-glue-asset.html)
+
+## Recommended flow
+
+Use this lifecycle for every table:
+
+1. Publisher creates a Glue table in producer account P. [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/grant-access-to-glue-asset.html)
+2. Producer-side automation or admin marks it as publishable and grants cross-account Lake Formation access to account M. For named-resource sharing, Lake Formation commonly requires `DESCRIBE` on the database and `SELECT`/`DESCRIBE` on tables, often with grant option where downstream grantability is needed. [amazonaws](https://www.amazonaws.cn/en/blog-selection/configure-cross-region-table-access-with-the-aws-glue-catalog-and-aws-lake-formation/)
+3. Account M accepts the RAM share if required and creates resource links if you use the shared-catalog pattern. [blog.pesky](https://blog.pesky.moe/posts/2025-08-12-glue-region/)
+4. Management discovery job updates `eligible_source_tables`, either from shared Glue/resource links or by creating/running a Glue data source in DataZone/SMUS. AWS documents that Glue data sources import technical metadata into project inventory and can optionally publish on import. [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/data-source-glue.html)
+5. Publisher opens your UI, searches/selects one eligible table.
+6. Backend validates ownership, status, and idempotency, then performs publish automation.
+7. Published asset becomes visible to domain consumers in the SMUS/DataZone catalog, while inventory-only assets remain visible only within the project until published. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/userguide/publishing-data.html)
+
+## API sequence
+
+A practical backend sequence is:
+
+- `refreshEligibleTables(publisherScope)`  
+  - list shared/resource-linked Glue tables or query DataZone/SMUS project inventory,  
+  - upsert `eligible_source_tables`. [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/data-source-glue.html)
+
+- `listEligibleTablesForPublisher(userId)`  
+  - query RDS, not AWS live.  
+  - return rows with friendly labels, schema metadata, and status. [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/data-publishing.html)
+
+- `createAssetFromTable(selectionId, businessMetadata)`  
+  1. load row from `eligible_source_tables`,  
+  2. verify `eligible_boolean`,  
+  3. if no inventory asset exists, create or run Glue data source for the corresponding DB scope,  
+  4. wait for ingestion completion,  
+  5. update business metadata/forms if needed,  
+  6. publish the inventory asset or use publish-on-import if acceptable,  
+  7. persist resulting catalog asset identifiers and status. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/userguide/manually-start-data-source-run.html)
+
+For automation, prefer **inventory first, publish second** instead of immediate `publishOnImport=true` when publishers need to add business metadata or approval context before consumers discover the asset. AWS explicitly notes that imported assets can stay in project inventory first, then be published later, and only published assets are discoverable by other domain users. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/userguide/manually-start-data-source-run.html)
+
+## UI states
+
+Your picker should expose explicit statuses so the workflow is clear:
+
+| UI status | Meaning |
+|---|---|
+| Draft in producer | Table exists in Glue but has not been shared/onboarded yet. |
+| Shared to management | Lake Formation/RAM step complete; table is technically reachable.  [docs.aws.amazon](https://docs.aws.amazon.com/lake-formation/latest/dg/cross-account-permissions.html) |
+| In inventory | Table metadata has been imported into SMUS/DataZone project inventory.  [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/data-source-glue.html) |
+| Ready to publish | Required metadata present; backend can create/publish asset.  [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/data-publishing.html) |
+| Published | Discoverable by consumers in catalog.  [docs.aws.amazon](https://docs.aws.amazon.com/fr_fr/sagemaker-unified-studio/latest/userguide/publishing-data-asset.html) |
+
+This makes the app understandable to publishers: they are not “creating SMUS assets,” they are “submitting a Glue table for catalog publication.” That matches your actual responsibility split. [docs.aws.amazon](https://docs.aws.amazon.com/fr_fr/sagemaker-unified-studio/latest/userguide/publishing-data-asset.html)
+
+## Design choices
+
+I would strongly recommend these choices:
+
+- Use **RDS as the picker cache/system of workflow state**, not Glue live queries at page render time.
+- Use **backend-only publish roles**, never end-user AWS permissions for publishing. [docs.aws.amazon](https://docs.aws.amazon.com/fr_fr/sagemaker-unified-studio/latest/userguide/publishing-data-asset.html)
+- Use **Glue data source -> project inventory -> publish** as the normal path, because it aligns with how SMUS/DataZone model discoverability. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/userguide/create-glue-data-source.html)
+- Keep **publish-on-import disabled by default** if publishers must add metadata, ownership text, subscription terms, or internal approval before consumers can discover assets. [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/data-source-glue.html)
+
+## Minimal schema
+
+A minimal relational design could be:
+
+- `publishers(id, identity_key, producer_account_id, default_project_id)`
+- `eligible_source_tables(id, publisher_id, account_id, region, database_name, table_name, inventory_asset_id, data_source_id, status, eligible, last_sync_at, unique(account_id, region, database_name, table_name))`
+- `asset_publication_requests(id, eligible_source_table_id, requested_by, requested_at, business_name, business_description, status, published_asset_id, error_message)`
+- `publication_events(id, request_id, step, status, payload_json, created_at)`
+
+That gives you strong idempotency, auditability, and retry support for the automation path. The `publication_events` table is especially useful because DataZone/SMUS ingestion and publishing are multi-step and asynchronous. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/APIReference/API_CreateDataSource.html)
+
+## Guardrails
+
+Add these validations before publishing:
+- table still exists in Glue/shared inventory,
+- publisher is still authorized for that source row,
+- backend/project role still has required Lake Formation permissions,
+- no already-published active asset exists for the same source unless versioning/update is intended,
+- required business metadata is complete. [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/data-publishing.html)
+
+The clean mental model is: **Glue table is the source object, inventory asset is the staging object, catalog asset is the discoverable object**. Your backend owns the transitions between those states. [docs.aws.amazon](https://docs.aws.amazon.com/fr_fr/sagemaker-unified-studio/latest/userguide/publishing-data-asset.html)
+
+
+-----
+
+
+
+Yes — here is a concrete design that you can implement. The core principle is: the publisher selects a **source Glue table** in your app, but only the management backend performs the **inventory ingestion + publication** steps that make the asset discoverable to consumers in SMUS/DataZone. Project inventory assets are private to project members until explicitly published, and only published assets become visible in the catalog. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/userguide/publishing-data-asset.html)
+
+## Sequence flow
+
+A practical end-to-end sequence looks like this:
+
+1. Publisher creates a Lake Formation-managed Glue table in producer account P. SMUS-managed Glue assets require Lake Formation-managed tables, and the publishing project role must later have `DESCRIBE`, `DESCRIBE GRANTABLE`, `SELECT`, and `SELECT GRANTABLE` on the database/table. [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/grant-access-to-glue-asset.html)
+2. Producer-side automation shares the approved database/table to account M using Lake Formation named-resource sharing; for external accounts, grantable permissions are part of the cross-account model, and only the data lake admin in the consumer account can initially see/use the shared resource until it is delegated further. [docs.aws.amazon](https://docs.aws.amazon.com/lake-formation/latest/dg/cross-account-named-resource.html)
+3. In account M, accept the AWS RAM share if needed and create Glue resource links for the shared database/table. Lake Formation notes that resource-link permissions and target-table permissions are separate: granting `DESCRIBE` on a resource link does not itself grant access to the linked target. [noise.getoto](https://noise.getoto.net/2022/01/19/securely-share-your-data-across-aws-accounts-using-aws-lake-formation/)
+4. Management discovery job reads the shared/resource-linked metadata and upserts your RDS row in `eligible_source_tables`. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/userguide/publishing-data.html)
+5. Publisher opens your UI and selects a row from `eligible_source_tables`.
+6. Backend validates authorization, ensures the SMUS/DataZone project role has required Lake Formation rights on the external Glue DB/table, then either creates/runs a Glue data source or maps to an existing inventory asset. AWS states external Glue databases used by a SMUS project require explicit Lake Formation permissions on the project IAM role. [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/lake-formation-permissions-for-amazon-sagemaker-unified-studio.html)
+7. Backend enriches inventory metadata if needed, then publishes the asset from project inventory into the catalog. Published assets become discoverable to other domain users; inventory-only assets do not. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/userguide/publishing-data-asset.html)
+
+## Sequence diagram
+
+Here is the logical sequence in Mermaid form:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Pub as Publisher User
+    participant UI as Management UI
+    participant API as Management Backend (Account M)
+    participant RDS as RDS Eligible Tables
+    participant LFp as Lake Formation / Glue (Producer P)
+    participant LFm as Lake Formation / Glue (Mgmt M)
+    participant DZ as SMUS/DataZone Project
+
+    Pub->>LFp: Create Glue table in producer account
+    LFp-->>API: Optional event/onboarding trigger
+    API->>LFp: Verify table metadata + governance eligibility
+    API->>LFp: Grant cross-account LF share to account M
+    LFp-->>LFm: Share DB/table via RAM/LF
+    API->>LFm: Accept share / create resource links
+    API->>RDS: Upsert eligible_source_tables row
+
+    Pub->>UI: Open "Create asset from table"
+    UI->>API: List eligible tables for this publisher
+    API->>RDS: Query eligible rows by publisher scope
+    RDS-->>API: Return eligible rows
+    API-->>UI: Return filtered table list
+
+    Pub->>UI: Select table + enter business metadata
+    UI->>API: Submit publication request
+    API->>RDS: Lock row / create publication request
+    API->>DZ: Create or run Glue data source / resolve inventory asset
+    DZ-->>API: Inventory asset available
+    API->>DZ: Update metadata / publish asset
+    DZ-->>API: Catalog asset published
+    API->>RDS: Mark request published + save asset IDs
+    API-->>UI: Success response
+```
+
+The key boundary is that the UI never calls AWS directly for publishing; it only operates on backend-managed rows and requests. That keeps AWS permissions centralized and auditable. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/userguide/publishing-data.html)
+
+## IAM and LF grants
+
+You should model permissions in four layers:
+
+| Layer | Principal | Needed access |
+|---|---|---|
+| Producer governance | Producer LF admin/share role | Grant cross-account DB/table permissions from P to M.  [docs.aws.amazon](https://docs.aws.amazon.com/lake-formation/latest/dg/cross-account-named-resource.html) |
+| Consumer discovery | Management discovery role in M | Read shared metadata, manage resource links, refresh RDS inventory.  [noise.getoto](https://noise.getoto.net/2022/01/19/securely-share-your-data-across-aws-accounts-using-aws-lake-formation/) |
+| SMUS publish context | SMUS/DataZone project IAM role in M | Access external Glue database/table with explicit Lake Formation grants.  [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/lake-formation-permissions-for-amazon-sagemaker-unified-studio.html) |
+| App workflow | Management backend publish role | Call DataZone/SMUS APIs to create/run data sources and publish assets.  [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/APIReference/API_CreateDataSource.html) |
+
+For the producer-to-management Lake Formation share, the minimum named-resource pattern is typically:
+- on the database: `DESCRIBE`,
+- on the table: `DESCRIBE`, `SELECT`,
+- include grantable permissions if the consumer-side admin/project must further delegate access. AWS explicitly states cross-account named-resource sharing to external accounts uses grantable permissions, and the consumer account admin then delegates to local principals. [docs.amazonaws](https://docs.amazonaws.cn/en_us/lake-formation/latest/dg/granting-table-permissions.html)
+
+For the SMUS project role on an external database, AWS says you must explicitly attach Lake Formation permissions for that role when publishing assets from a Glue database outside the project. For managed Glue assets, the publishing project role must have `DESCRIBE` and `DESCRIBE GRANTABLE` on the database, plus `DESCRIBE`, `SELECT`, `DESCRIBE GRANTABLE`, and `SELECT GRANTABLE` on the table. [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/lake-formation-permissions-for-amazon-sagemaker-unified-studio.html)
+
+Also remember that if you create a resource link in M, granting `DESCRIBE` on the resource link lets a local principal see the link, but does not grant permissions on the underlying shared target. Those target permissions must still exist separately. [docs.aws.amazon](https://docs.aws.amazon.com/lake-formation/latest/dg/granting-link-permissions.html)
+
+## Backend APIs
+
+I would define these backend operations:
+
+- `POST /onboarding/share-table`
+  - input: publisher account, region, db, table
+  - action: validate table exists and is LF-governed; initiate/verify share to M; create resource links if you automate that. [docs.aws.amazon](https://docs.aws.amazon.com/lake-formation/latest/dg/cross-account-permissions.html)
+
+- `POST /inventory/refresh`
+  - input: publisher scope or account scope
+  - action: enumerate shared/resource-linked tables; upsert `eligible_source_tables`. [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/data-source-glue.html)
+
+- `GET /publishable-tables`
+  - input: authenticated publisher
+  - action: return only rows mapped to that publisher from RDS. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/userguide/publishing-data.html)
+
+- `POST /asset-publications`
+  - input: `eligible_source_table_id` + business metadata
+  - action: create idempotent publication request, create/run data source if needed, resolve inventory asset, publish inventory asset, persist result. DataZone documents `CreateDataSource`, and data-source runs can also be started manually/through automation flows. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/APIReference/API_CreateDataSource.html)
+
+- `GET /asset-publications/{id}`
+  - action: poll publication status from RDS/workflow state.
+
+This split keeps the table picker fast because the UI reads from RDS, not from live cross-account Glue calls on every page load. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/APIReference/API_CreateDataSource.html)
+
+## RDS schema
+
+A solid minimal schema is:
+
+### `eligible_source_tables`
+- `id` UUID PK
+- `publisher_id`
+- `producer_account_id`
+- `region`
+- `glue_database_name`
+- `glue_table_name`
+- `glue_table_arn`
+- `lf_share_status`
+- `resource_link_db`
+- `resource_link_table`
+- `inventory_asset_id`
+- `inventory_status`
+- `eligible_boolean`
+- `eligibility_reason`
+- `last_synced_at`
+- unique(`producer_account_id`,`region`,`glue_database_name`,`glue_table_name`)
+
+### `asset_publication_requests`
+- `id` UUID PK
+- `eligible_source_table_id`
+- `requested_by`
+- `business_name`
+- `business_description`
+- `metadata_forms_json`
+- `status`
+- `catalog_asset_id`
+- `inventory_asset_id`
+- `idempotency_key`
+- `created_at`,`updated_at`
+
+### `publication_events`
+- `id`
+- `request_id`
+- `step`
+- `status`
+- `detail_json`
+- `created_at`
+
+This supports retries, audit history, and reconciliation jobs when async AWS steps complete later than the user session. DataZone inventory/publish operations are inherently staged, so durable workflow state is important. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/userguide/manually-start-data-source-run.html)
+
+## Guardrails
+
+Before publishing, the backend should verify:
+
+- the source row is still mapped to the requesting publisher,
+- the underlying Glue table still exists,
+- the table is still LF-managed and shared to M,
+- the SMUS project role still has required external-database Lake Formation permissions,
+- there is no active published asset for the same source unless you intend re-publish/version update,
+- required business metadata is present. [docs.aws.amazon](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/grant-access-to-glue-asset.html)
+
+It is also wise to lock the `eligible_source_tables` row or enforce one active publication request per source table, so two users cannot publish the same source simultaneously. That is an application design choice, but it fits the “latest published version is active” model in DataZone. [docs.aws.amazon](https://docs.aws.amazon.com/datazone/latest/userguide/publishing-data-asset.html)
+
+## Preferred operating model
+
+The most scalable model for you is:
+
+- **Producer account** owns data creation.
+- **Lake Formation share** makes a table eligible.
+- **Management account** owns discovery cache and workflow.
+- **SMUS/DataZone project inventory** is the staging area.
+- **Catalog publication** is the final discoverability step for consumers. [docs.aws.amazon](https://docs.aws.amazon.com/lake-formation/latest/dg/cross-account-permissions.html)
+
+That maps cleanly to your requirement: publishers cannot create SMUS assets directly, but they can safely choose which of their Glue tables should become catalog assets, and consumers only discover the assets after backend publication. [docs.aws.amazon](https://docs.aws.amazon.com/fr_fr/sagemaker-unified-studio/latest/userguide/publishing-data-asset.html)
+
